@@ -1,294 +1,196 @@
-import asyncio
-import os
-import random
-import re
-from typing import Callable, Optional
+import time
+import concurrent.futures
+from deep_translator import GoogleTranslator
+from deep_translator.exceptions import RequestError
+import pandas as pd
 import streamlit as st
-from googletrans import Translator
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
-from streamlit.runtime.uploaded_file_manager import UploadedFile
+import charset_normalizer
 
-# プログレス通知用コールバックの型定義
-ProgressCallback = Callable[[int, int, str, str], None]
+# ページ設定
+st.set_page_config(
+    page_title="長文翻訳ツール", page_icon="🌐", layout="centered"
+)
 
-
-# -------------------------------------------------------------------
-# 1. 翻訳ロジッククラス (FileTranslator)
-# -------------------------------------------------------------------
-class FileTranslator:
-    """翻訳エンジンとファイル翻訳の実行を担当するクラス"""
-
-    def __init__(
-        self,
-        engine_key: str,
-        src_lang: str = "ja",
-        dest_lang: str = "en",
-        show_browser: bool = False,
-    ) -> None:
-        self.engine_key: str = engine_key
-        self.src_lang: str = src_lang
-        self.dest_lang: str = dest_lang
-        self.show_browser: bool = show_browser
-
-    async def _translate_by_lib(self, text: str) -> str:
-        """googletrans ライブラリによる翻訳"""
-        translator = Translator()
-        return translator.translate(text, src=self.src_lang, dest=self.dest_lang).text
-
-    async def _translate_by_playwright_api(self, text: str, page: Page) -> str:
-        """Playwright内部ネットワーク(page.request)を使用した高速API通信"""
-        url = f"https://translate.google.com/translate_a/single?client=gtx&sl={self.src_lang}&tl={self.dest_lang}&dt=t&q={text}"
-        response = await page.request.get(url)
-        if not response.ok:
-            raise RuntimeError(f"HTTP Error: {response.status}")
-        data = await response.json()
-        return "".join(item[0] for item in data[0] if item[0])
-
-    async def _translate_by_playwright_ui(self, text: str, page: Page) -> str:
-        """Playwrightによる画面自動操作（タイムアウト5秒＆スマートウェイト）"""
-        TIMEOUT_MS = 5000
-
-        try:
-            textarea = page.locator('textarea[aria-label="原文"]')
-            await textarea.clear(timeout=TIMEOUT_MS)
-            await textarea.fill(text, timeout=TIMEOUT_MS)
-
-            result_span = page.locator('span[jsname="pq348e"]')
-
-            # 固定sleepではなく、翻訳テキストが反映されるまで最大5秒間スマート待機
-            await page.wait_for_function(
-                """(selector) => {
-                    const el = document.querySelector(selector);
-                    return el && el.innerText.trim().length > 0;
-                }""",
-                arg='span[jsname="pq348e"]',
-                timeout=TIMEOUT_MS,
-            )
-
-            return await result_span.inner_text(timeout=TIMEOUT_MS)
-
-        except PlaywrightTimeoutError:
-            raise RuntimeError(
-                "Google翻訳の画面操作がタイムアウト（5秒）しました。"
-                "画面仕様が変更されたか、ネットワーク接続が遅延しています。"
-            )
-
-    async def run(
-        self,
-        files: list[UploadedFile],
-        on_progress: Optional[ProgressCallback] = None,
-    ) -> list[tuple[str, str]]:
-        """
-        設定済みの条件で複数ファイルを順次翻訳・実行する
-
-        Args:
-            files: 翻訳対象のファイルリスト (UploadedFile)
-            on_progress: 進捗時に呼び出すコールバック関数
-
-        Returns:
-            list[tuple[str, str]]: (出力ファイル名, 翻訳テキスト) のリスト
-        """
-        results: list[tuple[str, str]] = []
-        total: int = len(files)
-        use_playwright: bool = self.engine_key in ["api", "ui"]
-
-        async def _loop(page: Optional[Page] = None) -> None:
-            for idx, file in enumerate(files, start=1):
-                if on_progress:
-                    on_progress(idx, total, file.name, "翻訳中...")
-
-                text: str = file.read().decode("utf-8")
-                if not text.strip():
-                    if on_progress:
-                        on_progress(idx, total, file.name, "空ファイルのためスキップ")
-                    continue
-
-                res_text: str = ""
-                if self.engine_key == "lib":
-                    res_text = await self._translate_by_lib(text[:5000])
-                elif self.engine_key == "api" and page:
-                    res_text = await self._translate_by_playwright_api(text[:5000], page)
-                elif self.engine_key == "ui" and page:
-                    res_text = await self._translate_by_playwright_ui(text[:5000], page)
-
-                results.append((f"translated_{file.name}", res_text))
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-
-        if use_playwright:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=not self.show_browser, args=["--no-sandbox"])
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                )
-                page = await context.new_page()
-                await page.goto(
-                    f"https://translate.google.com/?hl=ja&sl={self.src_lang}&tl={self.dest_lang}",
-                    wait_until="domcontentloaded",
-                )
-                await _loop(page)
-                await browser.close()
-        else:
-            await _loop()
-
-        return results
-
-
-# -------------------------------------------------------------------
-# 2. ヘルパー関数
-# -------------------------------------------------------------------
-def extract_file_number(filename: str) -> int:
-    """ファイル名末尾の数値を抽出してソート用に返す"""
-    numbers = re.findall(r"\d+", filename)
-    return int(numbers[-1]) if numbers else 0
-
-
-TRANSLATION_ENGINES: dict[str, str] = {
-    "googletrans (ライブラリ)": "lib",
-    "Playwright (内部API通信)": "api",
-    "Playwright (画面自動操作)": "ui",
+# 言語の選択肢（主要なもの）
+SUPPORTED_LANGUAGES = {
+    "英語 (English)": "en",
+    "日本語 (Japanese)": "ja",
+    "中国語（簡体字）": "zh-CN",
+    "中国語（繁体字）": "zh-TW",
+    "韓国語 (Korean)": "ko",
+    "フランス語 (French)": "fr",
+    "スペイン語 (Spanish)": "es",
+    "ドイツ語 (German)": "de",
+    "イタリア語 (Italian)": "it",
+    "ポルトガル語 (Portuguese)": "pt",
+    "ロシア語 (Russian)": "ru",
+    "ベトナム語 (Vietnamese)": "vi",
+    "タイ語 (Thai)": "th",
+    "インドネシア語 (Indonesian)": "id",
 }
 
 
-# -------------------------------------------------------------------
-# 3. Streamlit UI 構築
-# -------------------------------------------------------------------
-st.set_page_config(
-    page_title="Text Processing Toolkit",
-    page_icon="⚡",
-    layout="wide",
+def translate_chunk(text: str, source_lang: str, target_lang: str) -> str:
+  """単一のテキストチャンクを指定された言語に翻訳する関数（リトライ・レートリミット対策付き）"""
+  if not text.strip():
+    return ""
+
+  max_retries = 3
+  backoff_factor = 2
+
+  for attempt in range(max_retries):
+    try:
+      # Google翻訳のインスタンス生成
+      translator = GoogleTranslator(source=source_lang, target=target_lang)
+      translated = translator.translate(text)
+      # レートリミット回避のためのわずかなウェイト
+      time.sleep(0.1)
+      return translated
+    except RequestError as e:
+      # 制限超過やネットワークエラー時の指数バックオフ
+      if attempt < max_retries - 1:
+        sleep_time = backoff_factor**attempt
+        time.sleep(sleep_time)
+      else:
+        return f"[翻訳エラー: 制限または通信エラー] {text}"
+    except Exception as e:
+      return f"[エラー] {str(e)}"
+
+  return text
+
+
+def split_text_into_chunks(text: str, max_chars: int = 400) -> list:
+  """長文を適切な文字数（Google翻訳の制限内）の段落や文に分割する"""
+  paragraphs = text.split("\n")
+  chunks = []
+  current_chunk = ""
+
+  for para in paragraphs:
+    # 1段落が長すぎる場合はさらに句点等で分割するか、文字数で区切る
+    if len(current_chunk) + len(para) + 1 < max_chars:
+      current_chunk += para + "\n"
+    else:
+      if current_chunk:
+        chunks.append(current_chunk.strip())
+      current_chunk = para + "\n"
+
+  if current_chunk:
+    chunks.append(current_chunk.strip())
+
+  return chunks
+
+
+# --- UIデザイン ---
+st.title("🌐 高速長文翻訳ツール")
+st.write(
+    "テキストファイルやCSVをアップロードして、Google翻訳（無償版）で並列かつ高速に翻訳します。"
 )
 
-st.title("⚡ Text Processing Toolkit")
-st.caption("テキストファイルの分割・結合・翻訳を一括で処理するモダンWebツール")
+with st.sidebar:
+  st.header("⚙️ 翻訳設定")
 
-tab_split, tab_merge, tab_translate = st.tabs([
-    "✂️ テキスト分割 (Split)", 
-    "🔗 テキスト結合 (Merge)", 
-    "🌐 テキスト翻訳 (Translate)"
-])
+  source_name = st.selectbox(
+      "元言語", list(SUPPORTED_LANGUAGES.keys()), index=0
+  )  # デフォルト: 英語
+  target_name = st.selectbox(
+      "翻訳先言語", list(SUPPORTED_LANGUAGES.keys()), index=1
+  )  # デフォルト: 日本語
 
-# --- タブ 1: 分割 (Split) ---
-with tab_split:
-    st.header("テキストファイルの分割")
-    uploaded_file = st.file_uploader("分割したい `.txt` ファイルを選択", type=["txt"], key="split_file")
-    max_chars = st.number_input("1ファイルあたりの最大文字数", min_value=100, max_value=50000, value=5000, step=500)
+  source_lang = SUPPORTED_LANGUAGES[source_name]
+  target_lang = SUPPORTED_LANGUAGES[target_name]
 
-    if st.button("分割を実行する", type="primary", disabled=not uploaded_file):
-        content = uploaded_file.read().decode("utf-8")
-        base_name = os.path.splitext(uploaded_file.name)[0]
+  st.markdown("---")
+  st.info(
+      "💡 **ヒント**\n\n- 無償版APIの制限（Rate Limit）を考慮し、並列スレッド数とリクエスト間隔を調整しています。"
+  )
 
-        chunks: list[str] = []
-        current_chunk: list[str] = []
-        current_len: int = 0
+# メインコンテンツ：ファイルアップロード
+uploaded_file = st.file_uploader(
+    "翻訳するファイルを選択してください（対応形式: .txt, .csv）",
+    type=["txt", "csv"],
+)
 
-        for line in content.splitlines(keepends=True):
-            line_len = len(line)
-            if current_len + line_len > max_chars and current_chunk:
-                chunks.append("".join(current_chunk))
-                current_chunk = [line]
-                current_len = line_len
-            else:
-                current_chunk.append(line)
-                current_len += line_len
+if uploaded_file is not None:
+  file_extension = uploaded_file.name.split(".")[-1].lower()
 
-        if current_chunk:
-            chunks.append("".join(current_chunk))
+  if file_extension == "txt":
+    raw_bytes = uploaded_file.read()
+    # 文字コードの自動判定
+    detected = charset_normalizer.detect(raw_bytes)
+    encoding = detected.get("encoding") or "utf-8"
+    try:
+      raw_text = raw_bytes.decode(encoding, errors="ignore")
+    except Exception:
+      raw_text = raw_bytes.decode("utf-8", errors="ignore")
 
-        st.success(f"全 {len(chunks)} 件に分割されました！")
+  elif file_extension == "csv":
+    # CSVの場合はpandasに任せるか、必要に応じてencodingを指定
+    uploaded_file.seek(0)
+    try:
+      df = pd.read_csv(uploaded_file, encoding="utf-8")
+    except UnicodeDecodeError:
+      uploaded_file.seek(0)
+      df = pd.read_csv(uploaded_file, encoding="shift-jis")
+    raw_text = "\n".join(df.iloc[:, 0].astype(str).tolist())
 
-        cols = st.columns(3)
-        for idx, chunk in enumerate(chunks, start=1):
-            file_name = f"{base_name}_{idx}.txt"
-            cols[(idx - 1) % 3].download_button(
-                label=f"💾 {file_name} ({len(chunk)}文字)",
-                data=chunk,
-                file_name=file_name,
-                mime="text/plain",
-                key=f"dl_split_{idx}",
-            )
+  if raw_text:
+    st.subheader("📄 アップロードされたファイルのプレビュー")
+    st.text_area("元テキスト（冒頭）", raw_text[:1000] + "...", height=150)
 
-# --- タブ 2: 結合 (Merge) ---
-with tab_merge:
-    st.header("複数テキストファイルの結合")
-    uploaded_files = st.file_uploader(
-        "結合したい複数の `.txt` ファイルを選択",
-        type=["txt"],
-        accept_multiple_files=True,
-        key="merge_files",
-    )
-
-    if uploaded_files:
-        sorted_files = sorted(uploaded_files, key=lambda f: extract_file_number(f.name))
-        st.write("▼ 以下の順序で結合されます:")
-        st.code("\n".join([f.name for f in sorted_files]))
-
-        if st.button("結合を実行する", type="primary"):
-            merged_content = "".join([f.read().decode("utf-8") for f in sorted_files])
-            st.success(f"結合完了！ 合計文字数: {len(merged_content)} 文字")
-            st.download_button(
-                label="💾 結合されたファイルをダウンロード",
-                data=merged_content,
-                file_name="merged_output.txt",
-                mime="text/plain",
-            )
-
-# --- タブ 3: 翻訳 (Translate) ---
-with tab_translate:
-    st.header("テキストファイルの翻訳")
-    trans_files = st.file_uploader(
-        "翻訳したい `.txt` ファイルを選択 (複数可)",
-        type=["txt"],
-        accept_multiple_files=True,
-        key="trans_files",
-    )
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        src_lang = st.text_input("翻訳元言語コード", value="ja")
-    with col2:
-        dest_lang = st.text_input("翻訳先言語コード", value="en")
-    with col3:
-        selected_engine_label = st.selectbox("翻訳エンジン", list(TRANSLATION_ENGINES.keys()))
-
-    show_browser = st.checkbox("ブラウザ画面を表示して実行（Playwrightモード時のみ）", value=False)
-
-    if st.button("翻訳を開始する", type="primary", disabled=not trans_files):
-        sorted_trans_files = sorted(trans_files, key=lambda f: extract_file_number(f.name))
-        engine_key = TRANSLATION_ENGINES[selected_engine_label]
+    if st.button("🚀 翻訳を実行する", type="primary"):
+      with st.spinner("翻訳処理を実行中...（並列処理中）"):
+        # テキストを適切なチャンクに分割
+        chunks = split_text_into_chunks(raw_text, max_chars=400)
+        total_chunks = len(chunks)
 
         progress_bar = st.progress(0)
-        status_area = st.status("翻訳処理を開始します...", expanded=True)
+        status_text = st.empty()
 
-        # UI更新用のコールバック関数
-        def update_ui(idx: int, total: int, filename: str, message: str) -> None:
-            status_area.write(f"[{idx}/{total}] {filename}: {message}")
-            progress_bar.progress(idx / total)
+        translated_chunks = ["" * total_chunks] * total_chunks
 
-        # 1. 翻訳クラスをインスタンス化
-        translator = FileTranslator(
-            engine_key=engine_key,
-            src_lang=src_lang,
-            dest_lang=dest_lang,
-            show_browser=show_browser,
+        # 並列処理 (ThreadPoolExecutor) で高速化
+        # 無償版の制限（Too Many Requests）を回避するため、同時実行数は控えめ（例: 4〜5スレッド）に設定
+        max_workers = 4
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+          # 各チャンクの翻訳タスクをサブミット
+          future_to_index = {
+              executor.submit(
+                  translate_chunk, chunk, source_lang, target_lang
+              ): i
+              for i, chunk in enumerate(chunks)
+          }
+
+          completed = 0
+          for future in concurrent.futures.as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+              translated_chunks[idx] = future.result()
+            except Exception as exc:
+              translated_chunks[idx] = f"[エラー: {exc}]"
+
+            completed += 1
+            progress_bar.progress(completed / total_chunks)
+            status_text.text(
+                f"進捗: {completed} / {total_chunks} チャンク完了"
+            )
+
+        # 翻訳結果の結合
+        final_translated_text = "\n\n".join(translated_chunks)
+
+        st.success("✨ 翻訳が完了しました！")
+
+        # 結果の表示とダウンロード
+        st.subheader("📝 翻訳結果")
+        st.text_area(
+            "翻訳後テキスト", final_translated_text, height=300
         )
 
-        # 2. 実行 (run)
-        try:
-            translated_results = asyncio.run(
-                translator.run(sorted_trans_files, on_progress=update_ui)
-            )
-            status_area.update(label="すべての翻訳処理が完了しました！", state="complete")
-
-            st.subheader("📥 翻訳結果のダウンロード")
-            dl_cols = st.columns(3)
-            for idx, (filename, text_data) in enumerate(translated_results):
-                dl_cols[idx % 3].download_button(
-                    label=f"💾 {filename}",
-                    data=text_data,
-                    file_name=filename,
-                    mime="text/plain",
-                    key=f"dl_trans_{idx}",
-                )
-        except Exception as e:
-            status_area.update(label="エラーが発生しました", state="error")
-            st.error(f"処理中にエラーが発生しました: {e}")
+        st.download_button(
+            label="💾 翻訳結果をテキストファイルでダウンロード",
+            data=final_translated_text.encode("utf-8"),
+            file_name=f"translated_{target_lang}.txt",
+            mime="text/plain",
+        )
