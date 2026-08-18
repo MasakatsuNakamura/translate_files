@@ -76,7 +76,9 @@ playwright install chromium
 
 仮想環境を有効化した状態で、以下のコマンドを実行します。
 
+```
 streamlit run app.py
+```
 
 ブラウザが自動で立ち上がり（または指定のURLにアクセスし）、モダンな Web UI 操作画面が表示されます。
 
