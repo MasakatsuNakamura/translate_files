@@ -9,15 +9,18 @@
 ## ✨ 主な機能
 
 1. ✂️ テキスト分割 (Split)
+
 * 大きな .txt ファイルを指定した文字数（最大文字数）ごとに自動で綺麗に分割します。
 * 分割されたファイルは個別で即座にダウンロード可能です。
 
 
 2. 🔗 テキスト結合 (Merge)
+
 * 複数の .txt ファイルをファイル名の数値順に自動ソートして1つに結合します。
 
 
 3. 🌐 テキスト翻訳 (Translate)
+
 * 複数ファイルを順次自動翻訳。
 * 3つの翻訳エンジンから選択可能：
 * googletrans (ライブラリ)
@@ -41,21 +44,31 @@
 ### 1. 仮想環境（venv）の作成と有効化
 
 macOS / Linux の場合:
+
+```
 python -m venv .venv
 source .venv/bin/activate
+```
 
 Windows (PowerShell) の場合:
+
+```
 python -m venv .venv
 .venv\Scripts\Activate.ps1
+```
 
 ### 2. 依存ライブラリのインストール
 
+```
 pip install --upgrade pip
 pip install -r requirements.txt
+```
 
 ### 3. Playwright 用ブラウザのインストール
 
+```
 playwright install chromium
+```
 
 ---
 
@@ -71,9 +84,11 @@ streamlit run app.py
 
 ## 📦 依存関係 (requirements.txt)
 
+```
 streamlit
 googletrans==4.0.0-rc1
 playwright
+```
 
 ---
 
